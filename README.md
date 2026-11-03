@@ -1,6 +1,6 @@
-# CineMatch
+# Lumière
 
-CineMatch is a browser-based photo color-matching tool. Choose a photo to edit and a reference photo, compare the before-and-after preview, refine the suggested Lightroom-style settings, and export the result.
+Lumière is a browser-based photo color-matching tool. Choose a photo to edit and a reference photo, compare the before-and-after preview, refine the suggested Lightroom-style settings, and export the result.
 
 The app runs locally in your browser. Your photos are processed on your device and are not sent to an inference API.
 
