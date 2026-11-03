@@ -117,11 +117,64 @@ Then retrain from all labeled sources:
 
 More portrait photographs increase scene exposure, but solver-generated labels do not measure whether skin tones look natural. To claim high skin-segmentation precision/recall, create manually annotated skin masks across a balanced set of skin tones, lighting conditions, and camera pipelines, and evaluate against a held-out annotated set. The current model predicts global editing controls; it is not a face-aware local retoucher.
 
-### Training report and graph
+### Earlier expanded flower-heavy run
 
-The trainer reports the completed and best epoch, train and validation MSE, normalized MAE, and per-slider validation MAE against a zero-adjustment baseline in `dataset\flower_match\training_report.json`. It saves per-epoch training/validation MSE and normalized MAE to `dataset\flower_match\training_history.csv`. The MSE curve is saved as `docs\training_curves.svg`. Optional Word report-generation files and supplemental graphs are kept locally in the Git-ignored `local-report\` folder, not distributed with the application. Regression does not have a meaningful classification accuracy percentage; lower MAE/MSE is better, so the epoch-by-epoch MAE is reported instead of inventing an accuracy threshold.
+The earlier expanded run combined the existing flower, diverse-scene, and portrait manifests. Its prepared manifest and metrics are retained locally; the preparation command below now refers to the newer balanced workflow.
 
-The latest solver-distilled run used 1,096 pairs: 1,000 flower, 60 diverse-scene, and 36 additional portrait pairs (876 training / 220 validation groups). It completed 188 epochs and restored the best checkpoint from epoch 148. Validation MSE was 0.121745 (training MSE 0.115192). Mean normalized MAE across the 50 output values was 0.213570, compared with 0.329885 for predicting zero for every output. That is a 35.3% decrease in this setting-prediction metric against the baseline. Per-slider validation MAE is in the app's slider units:
+```powershell
+.\.venv\Scripts\python.exe -u train_color_matcher.py --manifest dataset\expanded_run\combined_manifest.jsonl --output public\models\color_matcher_candidate.onnx --epochs 400 --seed 23
+.\.venv\Scripts\python.exe local-report\generate_training_report.py --run-dir dataset\expanded_run
+```
+
+`prepare_expanded_manifest.py` hashes each source photo and assigns identical images to the same split, preventing duplicates from crossing train/validation. The completed run used 12,202 pairs: 11,106 synthetic known-setting pairs and 1,096 solver-labeled pairs. The sources contributed 12,010 flower pairs, 120 diverse-scene pairs, and 72 portrait pairs. The split contained 9,782 training / 2,420 validation examples across 3,006 / 752 source-image groups.
+
+The run completed all 400 epochs and selected epoch 399. Training MSE was 0.025064; validation MSE was 0.023078. Mean normalized MAE across all 50 outputs was 0.061148, compared with 0.257654 for the run's zero-output baseline (76.3% lower error, not 76.3% accuracy). Per-slider validation MAE is in the app's slider units:
+
+| Setting | Model MAE | Always-zero MAE |
+|---|---:|---:|
+| Temperature | 12.55 | 18.17 |
+| Tint | 12.48 | 13.55 |
+| Exposure | 0.23 | 0.63 |
+| Contrast | 18.54 | 23.45 |
+| Highlights | 28.13 | 29.46 |
+| Shadows | 20.25 | 27.96 |
+| Whites | 23.79 | 23.78 |
+| Blacks | 20.04 | 20.84 |
+| Vibrance | 23.92 | 27.99 |
+| Saturation | 11.13 | 17.89 |
+
+These are regression metrics over a mixed synthetic/teacher validation set, not human-perceived color quality, skin-tone accuracy, or a direct comparison with the earlier solver-only run. Validation was used to select the checkpoint, so this run does not have a separate final test set. The new ONNX remains a candidate; `public\models\color_matcher.onnx` was not replaced because this run lacks an independent human-rated comparison. The detailed report includes the data split, step-by-step training process, network diagram, dataset composition, training/validation learning curves, per-control error graph, limitations, reproducibility commands, and a short oral explanation with sample answers. It is generated as `local-report\expanded_run_MODEL_TRAINING_REPORT.docx` and `.txt`; figures are also saved individually as `expanded_run_training_metrics*.png`. Machine-readable metrics and per-epoch history are in `dataset\expanded_run\training_report.json` and `training_history.csv`; the MSE graph is `docs\training_curves.svg`. These generated datasets, models, and reports are not included in a fresh clone.
+
+### Earlier balanced five-category candidate
+
+To reduce the flower-heavy sampling, this earlier training manifest capped every category at the same number of distinct source-photo hashes and kept all edits of each image in one split. It retained 15 photos each of flowers, portraits, landscapes, architecture, and urban scenes (75 unique photos, 225 labeled pairs). Each category contributes 36 training pairs and 9 validation pairs; the validation pairs come from 3 distinct images per category. Multiple edits of one photo are variants, not additional independent photographs.
+
+The external Wikimedia Commons download was rate-limited with HTTP 429 after 50 portraits and 17 landscapes; no new architecture or urban images were obtained. The existing diverse-scene set supplied those categories. The training sample was then balanced across the five labels, so the additional downloaded photos are not all represented in this 225-pair subset.
+
+Rebuild the prepared data and train a separate candidate from PowerShell in the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe prepare_diverse_training.py --count-per-category 50 --output-dir dataset\scene_expansion
+.\.venv\Scripts\python.exe expand_scene_variants.py --manifest dataset\scene_expansion\train.jsonl --output dataset\scene_expansion\variants_manifest.jsonl --variants-per-photo 3 --seed 73
+.\.venv\Scripts\python.exe expand_scene_variants.py --manifest dataset\diverse_match\train.jsonl --output dataset\diverse_match\variants_manifest.jsonl --variants-per-photo 3 --seed 74
+.\.venv\Scripts\python.exe prepare_expanded_manifest.py --output dataset\balanced_run\combined_manifest.jsonl --additional-manifest dataset\scene_expansion\variants_manifest.jsonl --additional-manifest dataset\diverse_match\variants_manifest.jsonl --max-source-groups-per-category 50 --pairs-per-source 3 --seed 23
+.\.venv\Scripts\python.exe -u train_color_matcher.py --manifest dataset\balanced_run\combined_manifest.jsonl --output public\models\color_matcher_balanced_candidate.onnx --epochs 400 --seed 23
+.\.venv\Scripts\python.exe local-report\generate_training_report.py --run-dir dataset\balanced_run
+```
+
+In this run, 197 pairs used known synthetic settings and 28 used JavaScript-solver targets. The model stopped after 173 epochs under the 40-epoch patience rule and selected epoch 133. Training MSE was 0.025404; best validation MSE was 0.026984. Mean normalized MAE across 50 outputs was 0.074372, compared with 0.249826 for a zero-output baseline (70.2% lower regression error, not 70.2% accuracy).
+
+| Validation category | Pairs / unique photos | Model normalized MAE | Zero baseline MAE |
+|---|---:|---:|---:|
+| Architecture | 9 / 3 | 0.073551 | 0.249809 |
+| Flower | 9 / 3 | 0.065590 | 0.253083 |
+| Landscape | 9 / 3 | 0.065469 | 0.249459 |
+| Portrait | 9 / 3 | 0.086563 | 0.253679 |
+| Urban | 9 / 3 | 0.080687 | 0.243099 |
+
+These are regression results against generated/solver labels. Three validation photos per category are far too few to establish real-world scene quality, human preference, or skin-tone accuracy; no independent human-rated test was performed. The MAE must not be directly compared with the earlier run because the validation data differ. The balanced model remains separate as `public\models\color_matcher_balanced_candidate.onnx`; the app model was not replaced. The detailed report is `local-report\balanced_run_MODEL_TRAINING_REPORT.docx` and `.txt`; it includes the balanced dataset chart, per-category validation chart, learning curves, per-control errors, full epoch history, and an explanation of the acquisition limit. Metrics/history and run-specific graph files are in `dataset\balanced_run\`. Generated data, models, and reports are Git-ignored.
+
+For comparison, the previous solver-only run used 1,096 pairs: 1,000 flower, 60 diverse-scene, and 36 additional portrait pairs (876 training / 220 validation groups). It completed 188 epochs and restored the best checkpoint from epoch 148. Validation MSE was 0.121745 (training MSE 0.115192). Mean normalized MAE was 0.213570, compared with 0.329885 for the zero-output baseline (35.3% lower); its per-slider validation MAE was:
 
 | Setting | Model MAE | Always-zero MAE |
 |---|---:|---:|
@@ -136,9 +189,45 @@ The latest solver-distilled run used 1,096 pairs: 1,000 flower, 60 diverse-scene
 | Vibrance | 31.77 | 30.12 |
 | Saturation | 19.54 | 22.00 |
 
-This measures prediction of synthetic, solver-generated settings on held-out image groups, **not** perceptual similarity to human grading or equivalence to the JavaScript solver. The validation split is held out by source-image group. The training/validation curve is included below and saved as [`training_curves.svg`](./training_curves.svg) for reports.
+Both runs measure setting prediction, **not** perceptual similarity to human grading or equivalence to the JavaScript solver. The expanded run's validation split is held out by SHA-256 source-image group. The latest training/validation curve is included below and saved as [`training_curves.svg`](./training_curves.svg) for reports.
 
-![Training and validation MSE over 188 epochs](./training_curves.svg)
+![Training and validation MSE over 400 epochs](./training_curves.svg)
+
+### Full available mixed-scene run
+
+The later all-scenes run keeps every pair available in the local flower and scene manifests instead of cutting the flower data down to match the smaller categories. It contains 12,691 labeled pairs from 3,775 unique source photos:
+
+| Category | Labeled pairs | Unique source photos |
+|---|---:|---:|
+| Flower | 12,010 | 3,668 |
+| Portrait | 405 | 59 |
+| Landscape | 126 | 18 |
+| Architecture | 75 | 15 |
+| Urban | 75 | 15 |
+| **Total** | **12,691** | **3,775** |
+
+This is not 12,691 independent photographs. Several pairs are synthetic edits of the same source photo; splitting and validation are grouped by source-photo SHA-256 so edits of one photo cannot leak across train and validation. The labels comprise 11,595 synthetic known-setting pairs and 1,096 JavaScript-solver-labeled pairs. The run split 10,141 pairs from 3,019 source photos for training and 2,550 pairs from 756 source photos for validation.
+
+Because flower examples greatly outnumber other scenes, the trainer was run with category-balanced loss. Each category contributes equal aggregate weight to training and checkpoint selection, while all available examples remain in the data. Reproduce the training and detailed report from the prepared local manifest with:
+
+```powershell
+.\.venv\Scripts\python.exe .\train_color_matcher.py --manifest dataset\all_scenes_run\combined_manifest.jsonl --output public\models\color_matcher_all_scenes_candidate.onnx --epochs 400 --seed 23 --balance-category-loss
+.\.venv\Scripts\python.exe .\local-report\generate_training_report.py --run-dir dataset\all_scenes_run
+```
+
+The run requested 400 epochs and stopped at epoch 270 under the trainer's 40-epoch early-stopping patience; the lowest validation loss was at epoch 230, and that checkpoint was exported. Training MSE at the selected checkpoint was 0.028717 and validation MSE was 0.025456. The macro normalized MAE across the five categories was 0.070611, versus 0.253548 for the category-balanced zero-output baseline (72.2% lower regression error, not 72.2% accuracy).
+
+| Validation category | Pairs / unique photos | Model normalized MAE | Zero baseline MAE |
+|---|---:|---:|---:|
+| Architecture | 15 / 3 | 0.064466 | 0.249207 |
+| Flower | 2,406 / 734 | 0.071189 | 0.258046 |
+| Landscape | 27 / 4 | 0.065611 | 0.247708 |
+| Portrait | 87 / 12 | 0.072748 | 0.252779 |
+| Urban | 15 / 3 | 0.079040 | 0.260002 |
+
+The small non-flower validation groups make their per-category metrics unstable; Commons acquisition had been rate-limited after obtaining 50 additional portraits and 17 landscapes, and it yielded no new architecture or urban photos. These scores assess regression against synthetic/solver labels, **not** human-perceived color matching, skin-tone quality, or performance on an independently collected test set. No candidate was promoted automatically: `public\models\color_matcher_all_scenes_candidate.onnx` remains separate from the app's `color_matcher.onnx`.
+
+The detailed Word and text reports are `local-report\all_scenes_run_MODEL_TRAINING_REPORT.docx` and `.txt`. The report includes dataset composition and label sources, model and training pipeline, environment, training and validation curves, per-setting and per-category errors, all 270 epoch records, limitations, and reproducibility instructions. The figures are also saved individually as `local-report\all_scenes_run_training_metrics*.png`; machine-readable metrics and epoch history are `dataset\all_scenes_run\training_report.json` and `training_history.csv`. These outputs and the prepared dataset are Git-ignored and are not present in a fresh clone.
 
 The app evaluates the AI and calculation-based candidates and selects the one that is closer according to its image-statistics distance metric. This is a hybrid quality safeguard, not evidence that the model wins on every image or that the metric matches human judgment.
 

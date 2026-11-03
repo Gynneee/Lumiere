@@ -292,7 +292,7 @@ def target_vector(settings, sample_number):
 
 
 def load_dataset(manifest_paths):
-    features, targets, groups, splits = [], [], [], []
+    features, targets, groups, splits, categories = [], [], [], [], []
     image_features = {}
     total_rows = 0
     for manifest_path in manifest_paths:
@@ -322,6 +322,16 @@ def load_dataset(manifest_paths):
                         f"{group_prefix}::{row.get('group', row['source'])}"
                     )
                     splits.append(str(row.get("split", "")))
+                    category = row.get("category")
+                    if category is None:
+                        category = (
+                            "flower"
+                            if base.name == "flower_match"
+                            else "portrait"
+                            if base.name == "portrait_match"
+                            else Path(row["source"]).stem.split("_", 1)[0]
+                        )
+                    categories.append(str(category))
                     if len(features) % 500 == 0:
                         print(
                             f"Extracted image features for {len(features)}/{total_rows} "
@@ -347,6 +357,7 @@ def load_dataset(manifest_paths):
         np.asarray(targets, dtype=np.float32),
         np.asarray(groups),
         np.asarray(splits),
+        np.asarray(categories),
     )
 
 
@@ -401,9 +412,8 @@ def write_training_graph(output_dir, history):
 """
     graph_path = output_dir / "training_curves.svg"
     graph_path.write_text(svg, encoding="utf-8")
-    mae_graph_path = output_dir.parent / "local-report" / "training_mae_curves.svg"
+    mae_graph_path = output_dir / "training_mae_curves.svg"
     if all("validationMae" in row and "trainingMae" in row for row in history):
-        mae_graph_path.parent.mkdir(parents=True, exist_ok=True)
         largest_mae = max(
             max(row["trainingMae"], row["validationMae"]) for row in history
         )
@@ -469,12 +479,12 @@ class ColorMatcher(nn.Module):
         return self.layers(features)
 
 
-def train(manifest_paths, output_path, epochs, seed):
+def train(manifest_paths, output_path, epochs, seed, balance_category_loss):
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
     manifest_path = manifest_paths[0]
-    x, y, groups, splits = load_dataset(manifest_paths)
+    x, y, groups, splits, categories = load_dataset(manifest_paths)
 
     if np.any(splits):
         if not np.all(np.isin(splits, ("train", "validation"))):
@@ -506,10 +516,41 @@ def train(manifest_paths, output_path, epochs, seed):
     train_y = torch.from_numpy(y[training_indices])
     validation_x = torch.from_numpy(x[validation_indices])
     validation_y = torch.from_numpy(y[validation_indices])
+    training_categories = categories[training_indices]
+    validation_categories = categories[validation_indices]
+    category_weights = {}
+
+    def row_weights(category_values):
+        counts = {
+            str(category): int(np.count_nonzero(category_values == category))
+            for category in np.unique(category_values)
+        }
+        category_count = len(counts)
+        return torch.as_tensor(
+            [
+                len(category_values) / (category_count * counts[str(category)])
+                for category in category_values
+            ],
+            dtype=torch.float32,
+        )
+
+    if balance_category_loss:
+        train_weights = row_weights(training_categories)
+        validation_weights = row_weights(validation_categories)
+        category_weights = {
+            category: len(training_categories)
+            / (
+                len(np.unique(training_categories))
+                * int(np.count_nonzero(training_categories == category))
+            )
+            for category in sorted(set(training_categories))
+        }
+    else:
+        train_weights = torch.ones(len(training_indices), dtype=torch.float32)
+        validation_weights = torch.ones(len(validation_indices), dtype=torch.float32)
 
     model = ColorMatcher()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.0001)
-    loss_function = nn.MSELoss()
     best_loss = float("inf")
     best_weights = None
     best_epoch = 0
@@ -520,7 +561,8 @@ def train(manifest_paths, output_path, epochs, seed):
     for epoch in range(1, epochs + 1):
         model.train()
         optimizer.zero_grad()
-        loss = loss_function(model(train_x), train_y)
+        per_example_loss = torch.mean((model(train_x) - train_y) ** 2, dim=1)
+        loss = torch.mean(per_example_loss * train_weights)
         loss.backward()
         optimizer.step()
 
@@ -528,18 +570,24 @@ def train(manifest_paths, output_path, epochs, seed):
         with torch.no_grad():
             epoch_training_predictions = model(train_x)
             epoch_validation_predictions = model(validation_x)
-            training_loss = loss_function(
-                epoch_training_predictions, train_y
+            training_loss = (
+                torch.mean(
+                    torch.mean((epoch_training_predictions - train_y) ** 2, dim=1)
+                    * train_weights
+                ).item()
+            )
+            validation_loss = torch.mean(
+                torch.mean((epoch_validation_predictions - validation_y) ** 2, dim=1)
+                * validation_weights
             ).item()
-            validation_loss = loss_function(
-                epoch_validation_predictions, validation_y
+            training_mae = torch.mean(
+                torch.mean(torch.abs(epoch_training_predictions - train_y), dim=1)
+                * train_weights
             ).item()
-            training_mae = torch.abs(
-                epoch_training_predictions - train_y
-            ).mean().item()
-            validation_mae = torch.abs(
-                epoch_validation_predictions - validation_y
-            ).mean().item()
+            validation_mae = torch.mean(
+                torch.mean(torch.abs(epoch_validation_predictions - validation_y), dim=1)
+                * validation_weights
+            ).item()
         history.append(
             {
                 "epoch": epoch,
@@ -571,9 +619,50 @@ def train(manifest_paths, output_path, epochs, seed):
     with torch.no_grad():
         training_predictions = model(train_x).numpy()
         predictions = model(validation_x).numpy()
+    training_per_example_mse = np.mean(
+        (training_predictions - train_y.numpy()) ** 2, axis=1
+    )
+    training_per_example_mae = np.mean(
+        np.abs(training_predictions - train_y.numpy()), axis=1
+    )
+    training_mse = float(
+        np.mean(training_per_example_mse * train_weights.numpy())
+    )
+    training_normalized_mae = float(
+        np.mean(training_per_example_mae * train_weights.numpy())
+    )
     mae_by_output = np.abs(predictions - validation_y.numpy()).mean(axis=0)
     training_mae_by_output = np.abs(training_predictions - train_y.numpy()).mean(axis=0)
     zero_baseline_mae_by_output = np.abs(validation_y.numpy()).mean(axis=0)
+    category_metrics = {}
+    for category in sorted(set(validation_categories)):
+        category = str(category)
+        category_mask = validation_categories == category
+        category_predictions = predictions[category_mask]
+        category_targets = validation_y.numpy()[category_mask]
+        category_groups = groups[validation_indices][category_mask]
+        category_metrics[category] = {
+            "examples": int(category_mask.sum()),
+            "sourceImages": int(len(np.unique(category_groups))),
+            "mse": float(np.mean((category_predictions - category_targets) ** 2)),
+            "normalizedMae": float(
+                np.abs(category_predictions - category_targets).mean()
+            ),
+            "zeroBaselineNormalizedMae": float(
+                np.abs(category_targets).mean()
+            ),
+        }
+    macro_normalized_mae = float(
+        np.mean([metrics["normalizedMae"] for metrics in category_metrics.values()])
+    )
+    macro_zero_baseline_mae = float(
+        np.mean(
+            [
+                metrics["zeroBaselineNormalizedMae"]
+                for metrics in category_metrics.values()
+            ]
+        )
+    )
     basic_setting_limits = np.asarray((100, 100, 5, 100, 100, 100, 100, 100, 100, 100))
     basic_setting_names = (
         "temp",
@@ -590,7 +679,7 @@ def train(manifest_paths, output_path, epochs, seed):
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     graph_path, mae_graph_path = write_training_graph(
-        Path(__file__).resolve().parent / "docs", history
+        manifest_path.parent, history
     )
     history_path = manifest_path.parent / "training_history.csv"
     with history_path.open("w", encoding="utf-8", newline="") as history_file:
@@ -617,6 +706,28 @@ def train(manifest_paths, output_path, epochs, seed):
     )
     report = {
         "examples": len(x),
+        "seed": seed,
+        "epochsRequested": epochs,
+        "categoryMetrics": category_metrics,
+        "categoryLossBalanced": balance_category_loss,
+        "trainingCategoryWeights": category_weights,
+        "meanCategoryNormalizedAbsoluteError": float(
+            np.mean(
+                [
+                    metrics["normalizedMae"]
+                    for metrics in category_metrics.values()
+                ]
+            )
+        ),
+        "zeroBaselineMeanCategoryNormalizedAbsoluteError": float(
+            macro_zero_baseline_mae
+        ),
+        "microMeanNormalizedAbsoluteErrorOnAllOutputs": float(
+            mae_by_output.mean()
+        ),
+        "microZeroBaselineMeanNormalizedAbsoluteErrorOnAllOutputs": float(
+            zero_baseline_mae_by_output.mean()
+        ),
         "trainingExamples": len(training_indices),
         "validationExamples": len(validation_indices),
         "trainingSourceImages": len(np.unique(groups[training_indices])),
@@ -624,13 +735,13 @@ def train(manifest_paths, output_path, epochs, seed):
         "bestEpoch": best_epoch,
         "epochsCompleted": len(history),
         "validationMse": best_loss,
-        "trainingMse": float(np.mean((training_predictions - train_y.numpy()) ** 2)),
+        "trainingMse": training_mse,
         "trainingMeanNormalizedAbsoluteErrorOnAllOutputs": float(
-            training_mae_by_output.mean()
+            training_normalized_mae
         ),
-        "meanNormalizedAbsoluteErrorOnAllOutputs": float(mae_by_output.mean()),
+        "meanNormalizedAbsoluteErrorOnAllOutputs": macro_normalized_mae,
         "zeroBaselineMeanNormalizedAbsoluteErrorOnAllOutputs": float(
-            zero_baseline_mae_by_output.mean()
+            macro_zero_baseline_mae
         ),
         "history": history,
         "basicSettingMae": {
@@ -679,6 +790,11 @@ def main():
     )
     parser.add_argument("--epochs", type=int, default=400)
     parser.add_argument("--seed", type=int, default=23)
+    parser.add_argument(
+        "--balance-category-loss",
+        action="store_true",
+        help="Weight each scene category equally in training and validation loss.",
+    )
     args = parser.parse_args()
     if args.epochs < 1:
         parser.error("--epochs must be positive.")
@@ -687,6 +803,7 @@ def main():
         args.output.resolve(),
         args.epochs,
         args.seed,
+        args.balance_category_loss,
     )
 
 

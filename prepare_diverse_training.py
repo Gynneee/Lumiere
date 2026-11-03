@@ -1,4 +1,5 @@
 import argparse
+import csv
 import html
 import json
 import random
@@ -77,7 +78,17 @@ def read_url(request, timeout=60):
 
 
 def strip_html(value):
-    return re.sub(r"<[^>]*>", "", html.unescape(value or "")).strip()
+    text = re.sub(r"<[^>]*>", " ", html.unescape(value or ""))
+    return " ".join(text.split())
+
+
+def write_attribution(output_dir, credits):
+    with (output_dir / "ATTRIBUTION.tsv").open(
+        "w", encoding="utf-8", newline=""
+    ) as attribution:
+        attribution.write("\n".join(credits[:4]) + "\n")
+        writer = csv.writer(attribution, delimiter="\t", lineterminator="\n")
+        writer.writerows(credits[4:])
 
 
 def commons_search(query, result_count):
@@ -328,24 +339,20 @@ def prepare(count_per_category, seed, categories=None, output_dir=OUTPUT_DIR):
             }
         )
         credits.append(
-            "\t".join(
-                (
-                    candidate["title"],
-                    candidate["artist"],
-                    candidate["credit"],
-                    candidate["license"],
-                    candidate["licenseUrl"],
-                    candidate["pageUrl"],
-                    str(source_relative),
-                )
+            (
+                candidate["title"],
+                candidate["artist"],
+                candidate["credit"],
+                candidate["license"],
+                candidate["licenseUrl"],
+                candidate["pageUrl"],
+                str(source_relative),
             )
         )
         with manifest_path.open("w", encoding="utf-8") as manifest:
             for row in rows:
                 manifest.write(json.dumps(row, separators=(",", ":")) + "\n")
-        (output_dir / "ATTRIBUTION.tsv").write_text(
-            "\n".join(credits) + "\n", encoding="utf-8"
-        )
+        write_attribution(output_dir, credits)
         print(
             f"Prepared {category} photo {group_index + 1}/{per_category_index[category]}.",
             flush=True,
@@ -355,7 +362,7 @@ def prepare(count_per_category, seed, categories=None, output_dir=OUTPUT_DIR):
         for row in rows:
             manifest.write(json.dumps(row, separators=(",", ":")) + "\n")
     attribution_path = output_dir / "ATTRIBUTION.tsv"
-    attribution_path.write_text("\n".join(credits) + "\n", encoding="utf-8")
+    write_attribution(output_dir, credits)
     print(
         json.dumps(
             {
